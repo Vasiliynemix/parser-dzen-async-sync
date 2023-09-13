@@ -4,13 +4,12 @@ from datetime import datetime
 
 import json
 import os
-
-import requests
-
+import aiohttp
+import asyncio
 from bs4 import BeautifulSoup
 
 
-class Parse:
+class AsyncParse:
     result_json_file = 'result_data.json'
     path_to_images = 'images'
     path_to_images_news = 'images/news'
@@ -21,20 +20,28 @@ class Parse:
         self.url = 'https://dzen.ru/news/rubric/auto?issue_tld=ru'
         self.news_data = {}
         self.content = {}
+        self.session = aiohttp.ClientSession()
 
-    def __create_images_folder(self):
+    async def __aenter__(self):
+        await self.session.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        await self.session.__aexit__(exc_type, exc_value, traceback)
+
+    async def __create_images_folder(self):
         if not os.path.exists(self.path_to_images):
             os.mkdir(self.path_to_images)
         if os.path.exists(self.path_to_images_news):
             shutil.rmtree(self.path_to_images_news)
         os.mkdir(self.path_to_images_news)
 
-    def __create_json_folder(self):
+    async def __create_json_folder(self):
         if os.path.exists(self.path_to_json):
             shutil.rmtree(self.path_to_json)
         os.mkdir(self.path_to_json)
 
-    def __save_json_static(self) -> None:
+    async def __save_json_static(self):
         path = f'{self.path_to_json}'
         if not os.path.exists(path):
             os.mkdir(path)
@@ -42,34 +49,33 @@ class Parse:
         with open(f'{path}/{self.news_data["datetime"]}.json', 'a') as file:
             json.dump(self.news_data, file, indent=4, ensure_ascii=False)
 
-    def __save_images_static(self) -> None:
+    async def __save_images_static(self):
         path = f'{self.path_to_images_news}/{self.news_data["datetime"]}'
         if not os.path.exists(path):
             os.mkdir(path)
 
         try:
-            big_image = requests.get(self.content['image'], stream=True)
-            small_image = requests.get(self.content['preview'], stream=True)
+            async with self.session.get(self.content['image']) as big_image:
+                async with self.session.get(self.content['preview']) as small_image:
+                    with open(f'{path}/{uuid.uuid4()}.jpg', 'wb') as file:
+                        file.write(await big_image.read())
 
-            with open(f'{path}/{uuid.uuid4()}.jpg', 'wb') as file:
-                shutil.copyfileobj(big_image.raw, file)
-
-            with open(f'{path}/{uuid.uuid4()}.jpg', 'wb') as file:
-                shutil.copyfileobj(small_image.raw, file)
+                    with open(f'{path}/{uuid.uuid4()}.jpg', 'wb') as file:
+                        file.write(await small_image.read())
 
         except Exception as ex:
             print(ex)
 
-    def __get_json_info(self, url: str) -> dict:
-        session = requests.session()
-        request = session.post(url=url)
-        soup = BeautifulSoup(request.text, 'lxml')
-        all_scripts = soup.find_all('script')
-        for script in all_scripts:
-            text = str(script)
-            if self.line_label_in_script in text:
-                json_data = json.loads(text.split('window.Ya.Neo.dataSource')[1][1:-1])
-                return json_data.get('news')
+    async def __get_json_info(self, url: str) -> dict:
+        async with self.session.post(url=url) as response:
+            content = await response.text()
+            soup = BeautifulSoup(content, 'lxml')
+            all_scripts = soup.find_all('script')
+            for script in all_scripts:
+                text = str(script)
+                if self.line_label_in_script in text:
+                    json_data = json.loads(text.split('window.Ya.Neo.dataSource')[1][1:-1])
+                    return json_data.get('news')
 
     def __full_image_is_none(self, url: str) -> bool:
         if url is None:
@@ -106,13 +112,13 @@ class Parse:
             return False
         return True
 
-    def __save_content(self, item: dict) -> dict:
+    async def __save_content(self, item: dict) -> dict:
         self.content['title'] = item.get('title').replace('\xa0', ' ')
         self.content['link'] = item.get('url')
 
         self.__save_image_content(item=item)
 
-        data = self.__get_json_info(url=self.content.get('link'))
+        data = await self.__get_json_info(url=self.content.get('link'))
 
         subtitle_other_list = []
         subtitle_list = []
@@ -138,44 +144,42 @@ class Parse:
         self.content['subtitle'] = subtitle_list
         return self.content
 
-    def __save_item(self, item: dict):
+    async def __save_item(self, item: dict):
         time = datetime.strftime(datetime.now(), "%Y%m%d%H%M%S%f")
         self.news_data['datetime'] = time
-        content = self.__save_content(item=item)
+        content = await self.__save_content(item=item)
         self.news_data['content'] = [content]
+        print(self.content['title'])
+        print(self.content['link'])
+        print(self.content['subtitles_other'])
+        print(self.content['subtitle'])
+        print('*' * 100)
+        print('\n')
 
-    def __get_data(self, data: dict, value: str):
+    async def __get_data(self, data: dict, value: str):
         news = data.get(value)
         for item in news:
-            self.__save_item(item=item)
-            self.__save_json_static()
-            self.__save_images_static()
-            print(self.content['title'])
-            print(self.content['link'])
-            print(self.content['subtitles_other'])
-            print(self.content['subtitle'])
-            print('*' * 100)
-            print('\n')
+            await asyncio.gather(
+                self.__save_item(item=item),
+                self.__save_json_static(),
+                self.__save_images_static()
+            )
 
-        self.news_data = {}
-        self.content = {}
-
-    def parse(self):
+    async def parse(self):
         print('=============================---parser start---=============================')
-        self.__create_images_folder()
-        self.__create_json_folder()
+        await self.__create_images_folder()
+        await self.__create_json_folder()
 
-        data = self.__get_json_info(url=self.url)
+        data = await self.__get_json_info(url=self.url)
 
-        self.__get_data(data=data, value='top')
-        self.__get_data(data=data, value='feed')
+        await self.__get_data(data=data, value='top')
+        await self.__get_data(data=data, value='feed')
         print('=============================---parser stop---=============================')
 
 
-def main():
-    parse = Parse()
-    parse.parse()
-
+async def main():
+    async with AsyncParse() as async_parse:
+        await async_parse.parse()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
